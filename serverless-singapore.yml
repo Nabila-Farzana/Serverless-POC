@@ -1,0 +1,373 @@
+service: serverless-poc
+frameworkVersion: '3'
+
+
+provider:
+  name: aws
+  runtime: nodejs20.x
+  region: ap-southeast-1
+  iam:
+    role:
+      statements:
+        # Allow functions to read/write objects in a bucket
+        - Effect: Allow
+          Action:
+            - 's3:GetObject'
+          Resource:
+            - 'arn:aws:s3:::serverless-poc-file-storage/*'
+        
+        - Effect: Allow
+          Action:
+            - 'sqs:SendMessage'
+            - 'sqs:*'
+          Resource:
+            - '*'
+            - 'arn:aws:sqs:::ap-southeast-1*:serverless-poc-send-file-data-queue'
+        
+        - Effect: Allow
+          Action:
+            - 'dynamodb:PutItem'
+            - 'dynamodb:GetItem'
+            - 'dynamodb:DescribeStream'
+            - 'dynamodb:GetRecords'
+            - 'dynamodb:GetShardIterator'
+            - 'dynamodb:ListStreams'
+            - 'dynamodb:*'
+          Resource:
+            - '*'
+
+resources:
+  Resources:
+    EventBridgePipeRole:
+      Type: AWS::IAM::Role
+      Properties:
+        RoleName: serverless-poc-eventbridge-pipe-role
+        AssumeRolePolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service:
+                  - pipes.amazonaws.com
+              Action: sts:AssumeRole
+        Policies:
+          - PolicyName: ServerlessPocEventBridgePipePolicy
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - sqs:ReceiveMessage
+                    - sqs:DeleteMessage
+                    - sqs:GetQueueAttributes
+                  Resource:  !GetAtt MySQSQueue.Arn
+
+                - Effect: Allow
+                  Action:
+                    - sns:Publish
+                  Resource:  !Ref MyTopic
+
+    ApiGatewayAppsyncIntigrationRole:
+      Type: AWS::IAM::Role
+      Properties:
+        RoleName: serverless-poc-apigateway-appsync-intigration-role
+        AssumeRolePolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service:
+                  - apigateway.amazonaws.com
+              Action: sts:AssumeRole
+        Policies:
+          - PolicyName: ServerlessPocApiGatewayAppsyncIntigrationPolicy
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - appsync:GraphQL
+                  Resource:  arn:aws:appsync:ap-southeast-1:385187169402:apis/x3b7k6krsfhqnlmdetludsgmtq/*
+                - Effect: Allow
+                  Action: 
+                    - logs:CreateLogGroup
+                    - logs:CreateLogStream
+                    - logs:DescribeLogGroups
+                    - logs:DescribeLogStreams
+                    - logs:PutLogEvents
+                    - logs:GetLogEvents
+                    - logs:FilterLogEvents
+                  Resource: '*'
+
+    MyDynamoDbTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: serverless-poc-files
+        AttributeDefinitions:
+          - AttributeName: file
+            AttributeType: S
+        KeySchema:
+          - AttributeName: file
+            KeyType: HASH
+        ProvisionedThroughput:
+          ReadCapacityUnits: 5
+          WriteCapacityUnits: 5
+        StreamSpecification:
+          StreamViewType: NEW_IMAGE
+        
+    MySQSQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        DelaySeconds: 0
+        MaximumMessageSize: 1024
+        MessageRetentionPeriod: 345600
+        QueueName: serverless-poc-send-file-data-queue
+
+    MyTopic: 
+      Type: AWS::SNS::Topic
+      Properties:
+        TopicName: serverless-poc-send-file-topic
+
+    SNSSubscription:
+      Type: AWS::SNS::Subscription
+      Properties:
+          Region: ap-southeast-1
+          Endpoint : arn:aws:lambda:ap-northeast-1:385187169402:function:serverless-poc-dev-file-processor
+          Protocol: lambda
+          TopicArn:  !Ref MyTopic
+
+    ServerlessPocPipe:
+      Type: AWS::Pipes::Pipe
+      Properties:
+        RoleArn:  !GetAtt EventBridgePipeRole.Arn
+        Source:  !GetAtt MySQSQueue.Arn
+        Target:  !Ref MyTopic
+
+    AppsyncTargetLambdaFunctionRole:
+      Type: 'AWS::IAM::Role'
+      Properties:
+        AssumeRolePolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service: appsync.amazonaws.com
+              Action: sts:AssumeRole
+        Policies:
+          - PolicyName:  AppsyncTargetLambdaFunctionPolicy
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - lambda:InvokeFunction
+                  Resource: arn:aws:lambda:ap-southeast-1:385187169402:function:serverless-poc-dev-get-file-info
+                 
+    AppSyncApi:
+      Type: 'AWS::AppSync::GraphQLApi'
+      Properties:
+        Name: serverless-poc-get-file
+        AuthenticationType: API_KEY
+
+    AppSyncSchema:
+      Type: 'AWS::AppSync::GraphQLSchema'
+      Properties:
+        ApiId: !GetAtt AppSyncApi.ApiId
+        Definition: |
+            type File {
+              file: String!
+              metadata: MetaData!
+              created_at: String
+            }
+
+            type MetaData {
+              bucket: String!
+              type: String!
+              size: Float!
+              modified_at: String!
+              key: String!
+            }
+
+            type Query {
+              getFile(file: ID!): File
+            }
+
+            schema {
+              query: Query
+            }
+   
+    LambdaDataSource:
+      Type: 'AWS::AppSync::DataSource'
+      Properties:
+        Name: serverless_poc_get_file_data_source
+        Type: AWS_LAMBDA
+        ApiId: !GetAtt AppSyncApi.ApiId
+        LambdaConfig:
+          LambdaFunctionArn: arn:aws:lambda:ap-southeast-1:385187169402:function:serverless-poc-dev-get-file-info
+        ServiceRoleArn:  !GetAtt AppsyncTargetLambdaFunctionRole.Arn    
+
+    AppSyncApiKey:
+      Type: AWS::AppSync::ApiKey
+      Properties:
+        ApiId: !GetAtt AppSyncApi.ApiId
+
+    AppSyncPipeline:
+      Type: 'AWS::AppSync::Resolver'
+      Properties:
+        ApiId: !GetAtt AppSyncApi.ApiId
+        Code: |
+          export function request(ctx) {
+            return ctx;
+            }
+
+          export function response(ctx) {
+          return ctx.prev.result.data;
+          }
+        # CodeS3Location: s3://resolver-code-js/ResolverCodeJS.js    //If not using inline code we can put code in S3 Location and link here
+        FieldName: getFile
+        TypeName: Query
+        Kind: PIPELINE # Example of using the PIPELINE resolver type
+        PipelineConfig:
+          Functions:
+            - !GetAtt AppSyncFunction1.FunctionId
+        Runtime:
+          Name: APPSYNC_JS
+          RuntimeVersion: 1.0.0    
+
+
+    AppSyncFunction1:
+      Type: 'AWS::AppSync::FunctionConfiguration'
+      Properties:
+        ApiId: !GetAtt AppSyncApi.ApiId
+        Name: getFile
+        Description: To implement redundant logic across multiple pipeline resolvers. # we can change/remove if we want it's optional
+        DataSourceName: !GetAtt LambdaDataSource.Name
+        FunctionVersion: 2018-05-29
+        Code: |
+          export function request(ctx) {
+            util.error(ctx);
+            return {
+                operation: 'Invoke',
+                payload: {
+                    fieldName: ctx.info.fieldName,
+                    parentTypeName: ctx.info.parentTypeName,
+                    variables: ctx.info.variables,
+                    args: ctx.args,
+                    selectionSetList: ctx.info.selectionSetList,
+                    selectionSetGraphQL: ctx.info.selectionSetGraphQL,
+                },
+            };
+          }
+
+          export function response(ctx) {
+            const { result, error } = ctx;
+              if (error) {
+                  util.error(error.message, error.type, result);
+              }
+              return result;
+            }
+        # CodeS3Location: s3://resolver-code-js/ResolverFunctionCodeJS.js   //If not using inline code we can put code in S3 Location and link here
+        Runtime:
+          Name: APPSYNC_JS
+          RuntimeVersion: 1.0.0
+
+    MyApiGatewayRestApi:
+      Type: AWS::ApiGateway::RestApi
+      Properties:
+        Name: serverless-poc-rest-api 
+        EndpointConfiguration:
+          Types:
+            - REGIONAL
+    
+    ApiResource:
+      Type: AWS::ApiGateway::Resource
+      Properties:
+        ParentId: !GetAtt MyApiGatewayRestApi.RootResourceId
+        PathPart: api
+        RestApiId: !Ref MyApiGatewayRestApi
+
+    FilesResource:
+      Type: AWS::ApiGateway::Resource
+      Properties:
+        ParentId: !Ref ApiResource
+        PathPart: files
+        RestApiId: !Ref MyApiGatewayRestApi
+
+    MyApiGatewayMethod:
+      Type: AWS::ApiGateway::Method
+      Properties:
+        HttpMethod: GET
+        ResourceId: !Ref FilesResource
+        RestApiId: !Ref MyApiGatewayRestApi
+        AuthorizationType: NONE
+        RequestParameters:
+            method.request.header.x-api-key: true
+        Integration:
+          Credentials: !GetAtt ApiGatewayAppsyncIntigrationRole.Arn
+          IntegrationHttpMethod: POST
+          Type: AWS
+          Uri: !Sub "arn:aws:apigateway:${AWS::Region}:g537jikl6fbj5a4zghkx2jlteu.appsync:path/graphql"
+          IntegrationResponses:
+            - StatusCode: 200
+          PassthroughBehavior: WHEN_NO_TEMPLATES
+          RequestParameters:
+            integration.request.header.x-api-key: 'method.request.header.x-api-key'
+
+    APIGatewayDeployment:
+      Type: AWS::ApiGateway::Deployment
+      DependsOn:
+        - MyApiGatewayMethod
+      Properties:
+        RestApiId: !Ref MyApiGatewayRestApi
+        StageName: dev
+
+    MyApiKey:
+      Type: AWS::ApiGateway::ApiKey
+      Properties:
+        Name: AppsyncIntegrationKey
+        Description: API key for accessing the API
+        Enabled: true
+        Value: !GetAtt AppSyncApiKey.ApiKey
+
+    MyUsagePlan:
+      Type: AWS::ApiGateway::UsagePlan
+      Properties:
+        Description: Usage Plan for API
+        UsagePlanName: serverless-poc-usage-plan
+        ApiStages:
+          - ApiId: !Ref MyApiGatewayRestApi
+            Stage: dev
+        Throttle:
+          BurstLimit: 200
+          RateLimit: 100
+        Quota:
+          Limit: 1000
+          Period: MONTH
+
+    MyUsagePlanKey:
+      Type: AWS::ApiGateway::UsagePlanKey
+      Properties:
+        KeyId: !Ref MyApiKey
+        KeyType: API_KEY
+        UsagePlanId: !Ref MyUsagePlan
+
+functions:
+  store-file-in-db:
+    handler: store_file_db.handler
+    events:
+        - s3:
+            bucket: serverless-poc-file-storage
+            event: s3:ObjectCreated:*
+            rules:
+              - prefix: uploads/
+
+  ddb-stream-to-lambda:
+    handler: dynamodb-stream-listener.handler
+    events:
+      - stream: 
+          type: dynamodb
+          arn:
+            Fn::GetAtt: [MyDynamoDbTable, StreamArn]
+
+  get-file-info:
+      handler: get-file-info.handler
